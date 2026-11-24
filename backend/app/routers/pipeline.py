@@ -1,7 +1,9 @@
 """数据分析管道路由：事件采集、聚合执行、指标快照、分群计算等核心操作入口。"""
 from __future__ import annotations
 
-from fastapi import APIRouter
+from typing import Any
+
+from fastapi import APIRouter, Body
 
 from app.database import db
 from app.pipeline import (
@@ -43,6 +45,67 @@ def api_run_aggregation(window_id: int) -> dict:
     """对指定聚合窗口执行单次计算。"""
     svc = service_for("realtime_agg")
     return svc.run_aggregation(window_id)
+
+
+@router.post("/aggregation/{window_id}/stage")
+def api_stage_aggregation(window_id: int, payload: dict[str, Any] = Body(default_factory=dict)) -> dict:
+    """暂存一次（局部）重算：结果确认前对外不可见。
+
+    body 可选 ``dimension_keys``（分组列表）做局部重算，缺省重算全部分组。
+    """
+    svc = service_for("realtime_agg")
+    return svc.stage_recompute(window_id, dimension_keys=payload.get("dimension_keys"))
+
+
+@router.post("/aggregation/{window_id}/confirm")
+def api_confirm_aggregation(window_id: int, payload: dict[str, Any] = Body(default_factory=dict)) -> dict:
+    """确认暂存的重算批次，返回缓存数据依赖的完成范围。"""
+    svc = service_for("realtime_agg")
+    return svc.confirm_recompute(window_id, computation_version=payload.get("computation_version"))
+
+
+@router.post("/aggregation/{window_id}/fail")
+def api_fail_aggregation(window_id: int, payload: dict[str, Any] = Body(default_factory=dict)) -> dict:
+    """标记暂存批次失败：废弃本批结果，对外可用结果不变。"""
+    svc = service_for("realtime_agg")
+    return svc.fail_recompute(
+        window_id,
+        computation_version=payload.get("computation_version"),
+        reason=payload.get("reason", ""),
+    )
+
+
+@router.post("/cache/{config_id}/query")
+def api_cache_query(config_id: int, payload: dict[str, Any] = Body(default_factory=dict)) -> dict:
+    """按缓存配置 + 查询条件读取分析结果。
+
+    命中返回缓存版本；失效时按最新已确认聚合结果刷新。
+    返回中 ``used_result`` 说明实际使用的是哪次结果（聚合版本/完成范围/来源 id）。
+    """
+    svc = service_for("query_cache")
+    query_params = payload.get("query") or payload.get("query_params") or {}
+    return svc.refresh(config_id, query_params)
+
+
+@router.get("/cache/{config_id}/entries")
+def api_cache_entries(config_id: int) -> dict:
+    """列出配置下的缓存条目（含来源聚合版本与结果 id），用于回核。"""
+    svc = service_for("query_cache")
+    items = svc.entries(config_id)
+    return {"items": items, "total": len(items)}
+
+
+@router.post("/cache/{config_id}/invalidate")
+def api_cache_invalidate(config_id: int, payload: dict[str, Any] = Body(default_factory=dict)) -> dict:
+    """失效缓存：按窗口（可限定分组）局部失效，或按数据集整体失效。"""
+    svc = service_for("query_cache")
+    if payload.get("window_id") is not None:
+        count = svc.invalidate_window(int(payload["window_id"]), payload.get("dimension_keys"))
+    elif payload.get("dataset"):
+        count = svc.invalidate(str(payload["dataset"]))
+    else:
+        count = svc.invalidate_window_for_config(config_id)
+    return {"ok": True, "invalidated": count}
 
 
 @router.post("/metrics/compute-all")

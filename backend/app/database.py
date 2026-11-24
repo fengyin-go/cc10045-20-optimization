@@ -62,11 +62,51 @@ DDL_STATEMENTS = [
         computed_value REAL NOT NULL DEFAULT 0.0,
         event_count INTEGER NOT NULL DEFAULT 0,
         computation_version INTEGER NOT NULL DEFAULT 1,
+        status TEXT NOT NULL DEFAULT 'confirmed',
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         FOREIGN KEY (window_id) REFERENCES aggregation_windows(id)
     )""",
     "CREATE INDEX IF NOT EXISTS idx_agg_results_window ON aggregation_results(window_id, window_start)",
     "CREATE INDEX IF NOT EXISTS idx_agg_results_dim ON aggregation_results(dimension_key)",
+    "CREATE INDEX IF NOT EXISTS idx_agg_results_status ON aggregation_results(window_id, dimension_key, status, computation_version)",
+
+    # ==================== Query Cache Tier ====================
+    # 缓存配置：query_cache 模块的独立业务表（不再复用 aggregation_windows）
+    """CREATE TABLE IF NOT EXISTS query_cache_configs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        config_name TEXT NOT NULL,
+        related_dataset TEXT NOT NULL DEFAULT '',
+        cache_ttl_seconds INTEGER NOT NULL DEFAULT 300,
+        invalidation_policy TEXT NOT NULL DEFAULT 'version',
+        hit_rate REAL NOT NULL DEFAULT 0.0,
+        hit_count INTEGER NOT NULL DEFAULT 0,
+        miss_count INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT '草稿',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )""",
+
+    # 缓存数据：独立于 metric_values（真实指标快照），
+    # 每条缓存绑定窗口、查询条件、分组和实际聚合版本，支持来源回核。
+    """CREATE TABLE IF NOT EXISTS query_cache_entries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cache_config_id INTEGER NOT NULL,
+        cache_key TEXT NOT NULL,
+        query_conditions TEXT NOT NULL DEFAULT '{}',
+        window_id INTEGER,
+        dimension_key TEXT NOT NULL DEFAULT '__all__',
+        computation_version INTEGER NOT NULL DEFAULT 0,
+        window_start TEXT,
+        window_end TEXT,
+        source_result_id INTEGER,
+        cached_value REAL NOT NULL DEFAULT 0.0,
+        status TEXT NOT NULL DEFAULT 'active',
+        hit_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(cache_config_id, cache_key),
+        FOREIGN KEY (cache_config_id) REFERENCES query_cache_configs(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_qce_window_dim ON query_cache_entries(window_id, dimension_key)",
 
     # ==================== Metric Tier ====================
     """CREATE TABLE IF NOT EXISTS metrics (
@@ -373,8 +413,17 @@ class AnalyticsDB:
         conn.execute("PRAGMA busy_timeout=5000")
         for stmt in DDL_STATEMENTS:
             conn.execute(stmt)
+        self._migrate(conn)
         conn.commit()
         conn.close()
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """幂等迁移：为已有库补充新增列。"""
+        agg_cols = {row[1] for row in conn.execute("PRAGMA table_info(aggregation_results)")}
+        if "status" not in agg_cols:
+            # 历史数据视为已确认，保持对外可见结果不变
+            conn.execute("ALTER TABLE aggregation_results ADD COLUMN status TEXT NOT NULL DEFAULT 'confirmed'")
 
     @classmethod
     def get(cls) -> AnalyticsDB:

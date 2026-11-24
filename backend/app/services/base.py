@@ -22,7 +22,7 @@ class BaseModuleService:
             "realtime_agg": "aggregation_windows",
             "event_tracker": "events",
             "dashboard_builder": "dashboards",
-            "query_cache": "aggregation_windows",
+            "query_cache": "query_cache_configs",
             "segment_engine": "segments",
             "metric_store": "metrics",
             "drill_path": "drill_rules",

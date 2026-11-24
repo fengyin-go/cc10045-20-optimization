@@ -85,18 +85,26 @@ def ingest_events(event_definitions: list[dict[str, Any]], batch_id: str | None 
 # 实时聚合管道：从事件表读取数据，按窗口维度执行聚合
 # ============================================================================
 
-def compute_aggregation(window: dict[str, Any]) -> list[dict[str, Any]]:
+def compute_aggregation(
+    window: dict[str, Any],
+    *,
+    dimension_keys: list[str] | None = None,
+    status: str = "confirmed",
+) -> list[dict[str, Any]]:
     """对指定聚合窗口执行计算。
 
     从 events 表读取匹配数据源，按维度分组，在时间窗口内执行聚合函数。
     结果写入 aggregation_results 表，返回新增结果列表。
+
+    - ``dimension_keys`` 限定时只落库指定分组的局部重算结果，其余分组保持不变；
+    - ``status='pending'`` 时结果为暂存态，确认（confirm）之前对外不可见，
+      失败或废弃的暂存批次不会改变任何已确认结果。
     """
     window_id = window["id"]
-    data_source = window.get("数据源", "")
-    dimensions_raw = window.get("聚合维度", "[]")
-    agg_func = window.get("聚合函数", "COUNT")
-    window_type = window.get("window_type", "tumbling")
-    window_size = window.get("窗口大小", window.get("window_size_seconds", 60))
+    data_source = window.get("数据源") or window.get("data_source_module") or ""
+    dimensions_raw = window.get("聚合维度") or window.get("dimensions") or "[]"
+    agg_func = window.get("聚合函数") or window.get("agg_function") or "COUNT"
+    window_size = window.get("窗口大小") or window.get("window_size_seconds") or 60
 
     try:
         dims = json.loads(dimensions_raw) if isinstance(dimensions_raw, str) else dimensions_raw
@@ -137,6 +145,8 @@ def compute_aggregation(window: dict[str, Any]) -> list[dict[str, Any]]:
 
     # 执行聚合
     results = []
+    # 版本号在全部分批（含暂存/失败）上单调递增，失败批次会占用号段，
+    # 保证同一 (window, version) 永远不会指向两批不同的数据。
     version = db.fetchone(
         "SELECT COALESCE(MAX(computation_version), 0)+1 as v FROM aggregation_results WHERE window_id=?",
         [window_id],
@@ -144,8 +154,14 @@ def compute_aggregation(window: dict[str, Any]) -> list[dict[str, Any]]:
     comp_version = int(version["v"]) if version else 1
 
     agg_func_upper = agg_func.upper().strip()
+    wanted = {str(d) for d in dimension_keys} if dimension_keys else None
+    window_start_str = window_start.strftime("%Y-%m-%dT%H:%M:%S")
+    window_end_str = window_end.strftime("%Y-%m-%dT%H:%M:%S")
 
     for dim_key, group_events in groups.items():
+        if wanted is not None and dim_key not in wanted:
+            # 局部重算：未涉及的分组不重复落库，既有已确认结果保持有效
+            continue
         if agg_func_upper == "COUNT":
             value = float(len(group_events))
         elif agg_func_upper in ("SUM", "总金额", "总量"):
@@ -182,12 +198,13 @@ def compute_aggregation(window: dict[str, Any]) -> list[dict[str, Any]]:
 
         record_id = db.insert("aggregation_results", {
             "window_id": window_id,
-            "window_start": window_start.strftime("%Y-%m-%dT%H:%M:%S"),
-            "window_end": window_end.strftime("%Y-%m-%dT%H:%M:%S"),
+            "window_start": window_start_str,
+            "window_end": window_end_str,
             "dimension_key": dim_key,
             "computed_value": round(value, 4),
             "event_count": len(group_events),
             "computation_version": comp_version,
+            "status": status,
         })
         results.append({
             "id": record_id,
@@ -195,6 +212,10 @@ def compute_aggregation(window: dict[str, Any]) -> list[dict[str, Any]]:
             "dimension_key": dim_key,
             "computed_value": round(value, 4),
             "event_count": len(group_events),
+            "computation_version": comp_version,
+            "window_start": window_start_str,
+            "window_end": window_end_str,
+            "status": status,
         })
 
     return results
@@ -296,7 +317,7 @@ def _count_metric_value(metric: dict[str, Any]) -> int:
 def _gauge_metric_value(metric: dict[str, Any]) -> float:
     metric_name = metric["metric_name"]
     try:
-        row = db.fetchone("SELECT AVG(computed_value) as val FROM aggregation_results")
+        row = db.fetchone("SELECT AVG(computed_value) as val FROM aggregation_results WHERE status='confirmed'")
         return round(float(row["val"]), 4) if row and row["val"] else random.uniform(10, 500)
     except Exception:
         return random.uniform(10, 500)
@@ -636,7 +657,7 @@ def detect_anomaly(analysis: dict[str, Any]) -> dict[str, Any]:
         for dim in dims:
             agg_rows = db.fetchall(
                 "SELECT dimension_key, SUM(computed_value) as total FROM aggregation_results "
-                "WHERE dimension_key LIKE ? GROUP BY dimension_key",
+                "WHERE dimension_key LIKE ? AND status='confirmed' GROUP BY dimension_key",
                 [f"%{dim}%"],
             )
             total_all = sum(r["total"] for r in agg_rows)
